@@ -125,6 +125,59 @@ public class OrchestrationService {
         }
     }
 
+    /**
+     * 仅对指定 revision 重新送达（批量发布补投专用）。
+     *
+     * <p>不会产生新版本：命中 PENDING 直接重投同一 revision；
+     * 已应用 -> ALREADY_APPLIED（不再触碰设备）；已撤销/被取代 -> 原样返回终态结论，
+     * 保证已落定的版本不会被补投拉回生效。
+     */
+    public DispatchResult retryRevision(String deviceId, String ownerId, long revision) {
+        Device device = resolveOwned(deviceId, ownerId);
+        DeviceStateLedger ledger = ledgerFor(deviceId);
+        ledger.lock().lock();
+        try {
+            DesiredState state = ledger.find(revision);
+            if (state == null) {
+                DesiredState latest = ledger.latest();
+                long current = latest == null ? 0L : latest.getRevision();
+                log.warn("retryRevision ignored: deviceId={} revision={} not found, currentRevision={}",
+                        deviceId, revision, current);
+                return new DispatchResult(DeliveryOutcome.NOT_REVOKABLE, revision, current,
+                        "revision " + revision + " not found on device ledger");
+            }
+            switch (state.getPhase()) {
+                case APPLIED -> {
+                    log.info("retryRevision no-op: deviceId={} revision={} already applied",
+                            deviceId, revision);
+                    return new DispatchResult(DeliveryOutcome.ALREADY_APPLIED, revision,
+                            revision, "revision already applied, redelivery skipped");
+                }
+                case SUPERSEDED -> {
+                    log.info("retryRevision no-op: deviceId={} revision={} superseded",
+                            deviceId, revision);
+                    return new DispatchResult(DeliveryOutcome.SUPERSEDED, revision,
+                            ledger.latest().getRevision(), state.getLastDetail());
+                }
+                case REVOKED -> {
+                    log.info("retryRevision no-op: deviceId={} revision={} revoked",
+                            deviceId, revision);
+                    return new DispatchResult(DeliveryOutcome.REVOKED, revision,
+                            ledger.latest().getRevision(), state.getLastDetail());
+                }
+                case PENDING -> {
+                    DispatchResult result = deliver(device, state);
+                    log.info("retryRevision settled: deviceId={} revision={} outcome={}",
+                            deviceId, revision, result.outcome());
+                    return result;
+                }
+                default -> throw new IllegalStateException("unknown phase " + state.getPhase());
+            }
+        } finally {
+            ledger.lock().unlock();
+        }
+    }
+
     /** 撤销当前最新 PENDING 版本；已应用或不存在 PENDING 时返回 NOT_REVOKABLE。 */
     public DispatchResult revoke(String deviceId, String ownerId) {
         resolveOwned(deviceId, ownerId);

@@ -4,7 +4,9 @@
 
 1. 设备注册与存活状态维护（周期上报证明存活，乱序/过期/回退时间戳可区分地拒绝或忽略）；
 2. 期望状态下发与收敛（版本单调、并发唯一、同版本不重复应用、已撤销变更不复活，失败三分类）；
-3. 能力/固件版本兼容判定与归属方（owner）隔离（不兼容明确拒绝，越权与目标不存在可区分）。
+3. 能力/固件版本兼容判定与归属方（owner）隔离（不兼容明确拒绝，越权与目标不存在可区分）；
+4. 面向一批设备的发布（同一份配置+同一套兼容要求批量下发、逐台结论+整批汇总、
+   只补投未完成成员、重复触发幂等）。
 
 全部能力为内存实现 + 可控时钟，**不依赖任何外部服务、真实凭据或不可访问资源**。
 
@@ -62,6 +64,21 @@ PENDING ──未送达/被拒绝/失败──▶ 仍为 PENDING（只能用 ret
 `NOT_DELIVERED / REJECTED_* / EXECUTION_FAILED` 三类失败彼此可区分，且与 HTTP 层
 404（目标不存在）、403（越权）、409（重复注册）不混淆。
 
+### 1.5 批量发布 `DeviceRelease` 与成员结论
+
+一批发布 = `releaseId`（幂等键）+ 归属方 + 同一份载荷/兼容要求 + 逐台成员记录。
+
+- **批次与设备版本是一对多关系**：批次本身不引入额外版本号；首批触发时，每台目标设备
+  经单机下发路径获得各自账本中单调递增的 revision（各设备独立计数，互不相同也互不影响）。
+- **逐台结论**（`ReleaseMemberResult`）：deviceId + `DeliveryOutcome` + revision + detail，
+  在单机结论基础上补充两个批量场景类别：
+  - `OWNER_MISMATCH`：目标设备属于别的归属方（越权，不放行）；
+  - `DEVICE_NOT_FOUND`：目标设备不存在（与越权明确区分）。
+- **整批汇总**（`ReleaseSummary`）：total / applied / alreadyApplied / notDelivered /
+  rejectedIncompatible / rejectedByDevice / executionFailed / ownerMismatch /
+  deviceNotFound / superseded / revoked 分别计数。
+- **单台失败不扩散**：任何一台的结论（含连不上）不影响同批其它设备，也不把整批算作失败。
+
 ---
 
 ## 2. 收敛规则
@@ -77,6 +94,39 @@ PENDING ──未送达/被拒绝/失败──▶ 仍为 PENDING（只能用 ret
    `retry` 或重新 `dispatch`（新版本）推进。
 6. **归属隔离**：所有操作先查存在性（不存在 → 404），再校验 `X-Owner-Id` 与设备 owner
    （不匹配 → 403），判定顺序固定，结论稳定可区分。
+
+---
+
+## 2.1 批量发布：补投与幂等规则
+
+1. **releaseId 是幂等键**：首次 `POST /api/releases` 创建批次并逐台下发；
+   同一 releaseId 的重复提交（用户手抖、调用方网络重发）命中既有批次，
+   自动转为"只补投未完成成员"，最终结果唯一确定 —— 不创建新版本、不重复应用。
+   同 releaseId 但载荷/兼容要求不同 → 409 `RELEASE_CONFLICT`；归属方不同 → 403。
+2. **只补投未完成成员**：补投（重复提交或 `POST /api/releases/{id}/retry-incomplete`）
+   只处理 `NOT_DELIVERED / REJECTED_BY_DEVICE / EXECUTION_FAILED` 三类成员，
+   通过 `retryRevision` 重投该成员**已登记的同一 revision**（不产生新版本）；
+   成功（APPLIED/ALREADY_APPLIED）成员不再触碰设备。
+3. **已落定版本不复活**：补投时若该 revision 已被撤销或被更新版本取代，
+   成员结论落定 REVOKED / SUPERSEDED，不会被拉回生效。
+4. **不兼容成员永久挡下**：`REJECTED_INCOMPATIBLE` 成员不会被任何补投触碰 ——
+   即使设备重新上线、或其固件/能力信息随后变化，也不会自动补投生效；
+   要改变其期望状态，只能由归属方发起**新一批发布**（新 releaseId → 新 revision）。
+5. **设备重新上线只刷新存活**：存活判定（心跳/上线）与发布链路解耦，
+   设备上线不会顺带把已落定的版本再放一遍，也不会自动补投任何成员。
+6. **批量并发**：批内成员并行处理（独立线程池），每设备仍走各自的账本锁串行化；
+   同一 releaseId 的并发重复触发在批次锁内串行，N 次触发等价于 1 次。
+
+---
+
+## 2.2 批量场景下的归属与兼容边界
+
+- 每台设备下发**前**都按其归属方与**当时的**固件/能力做判定（与单机路径同一套规则）；
+- 显式列表中混入他方设备 → 该成员 `OWNER_MISMATCH`；不存在 → `DEVICE_NOT_FOUND`；
+  两者都不放行，且互不影响同批其它成员；
+- 不传 `deviceIds` 时按归属方圈定：只选 `ownerId == X-Owner-Id` 的设备，
+  不会碰到别人的设备；
+- 不兼容成员的 `detail` 列明全部违规原因（缺失能力逐项 + 固件越界）。
 
 ---
 
@@ -103,6 +153,9 @@ PENDING ──未送达/被拒绝/失败──▶ 仍为 PENDING（只能用 ret
 | `POST /api/devices/{id}/desired-state/dispatch` | 下发新版本 | header `X-Owner-Id` |
 | `POST /api/devices/{id}/desired-state/retry` | 重试最新 PENDING | header `X-Owner-Id` |
 | `POST /api/devices/{id}/desired-state/revoke` | 撤销最新 PENDING | header `X-Owner-Id` |
+| `POST /api/releases` | 批量发布（幂等：重复提交只补投未完成成员） | header `X-Owner-Id`，body: releaseId/deviceIds?/payload/requirements |
+| `POST /api/releases/{releaseId}/retry-incomplete` | 显式补投未完成成员（与重复提交同语义） | header `X-Owner-Id` |
+| `GET /api/releases/{releaseId}` | 查询一批发布的逐台结论与汇总 | header `X-Owner-Id` |
 | `POST /api/ops/liveness/sweep` | 触发一次全量 TTL 扫描 | 无（本地运维） |
 
 ---
@@ -125,6 +178,12 @@ scripts/local-verify.sh
   未送达/设备拒绝/执行失败三分类、失败后 retry 恢复、撤销后不复活、不兼容拒绝带原因；
 - `CompatibilityPolicyTest`：固件闭区间边界、能力缺失逐条列出；
 - `AccessControlTest`：跨 owner 越权（403 语义）与目标不存在（404 语义）可区分；
+- `ReleaseServiceTest`：批量发布逐台结论与汇总、归属方圈定、只补投未完成成员
+  （成功成员不被再触碰）、**12 线程并发重复触发幂等唯一**、不兼容成员重连后仍不被补投、
+  已撤销/被取代成员不被拉回、越权 vs 不存在 vs 幂等键冲突可区分、设备重连不重放、
+  断链恢复后 8 线程乱序并发补投恰好生效一次；
+- `ReleaseApiIntegrationTest`：批量发布 HTTP 入口、重复提交响应体逐字节一致、
+  409 `RELEASE_CONFLICT` / 403 / 404 边界；
 - `WebApiIntegrationTest`：经 MockMvc 验证全部 HTTP 入口结论与错误码一致。
 
 测试使用 `MutableClock`（可控时钟，见 `src/test/.../tests/MutableClock.java`），
@@ -160,17 +219,48 @@ curl -i localhost:8080/api/devices/edge-1/desired-state/retry -X POST -H 'X-Owne
 curl -i localhost:8080/api/devices/ghost
 ```
 
+批量发布手动联调：
+
+```bash
+# 再注册两台（一台属于别人）
+curl -s localhost:8080/api/devices -H 'Content-Type: application/json' -d '{
+  "deviceId":"edge-2","ownerId":"team-a","firmwareVersion":"1.4.0","capabilities":["gps"]}'
+curl -s localhost:8080/api/devices -H 'Content-Type: application/json' -d '{
+  "deviceId":"edge-3","ownerId":"team-b","firmwareVersion":"1.4.0","capabilities":["gps"]}'
+
+# 一次发布到多台（显式列表混入他方设备与不存在设备，结论逐台可见）
+curl -s localhost:8080/api/releases -H 'Content-Type: application/json' \
+  -H 'X-Owner-Id: team-a' -d '{
+    "releaseId":"rel-2026-10-08",
+    "deviceIds":["edge-1","edge-2","edge-3","ghost"],
+    "payload":{"mode":"eco"},
+    "requirements":{"requiredCapabilities":["gps"]}}'
+
+# 重复提交同一 releaseId（手抖/网络重发）-> 幂等，只补投未完成成员
+curl -s localhost:8080/api/releases -H 'Content-Type: application/json' \
+  -H 'X-Owner-Id: team-a' -d '{
+    "releaseId":"rel-2026-10-08",
+    "deviceIds":["edge-1","edge-2","edge-3","ghost"],
+    "payload":{"mode":"eco"},
+    "requirements":{"requiredCapabilities":["gps"]}}'
+
+# 显式补投 / 查询整批进度
+curl -s -X POST localhost:8080/api/releases/rel-2026-10-08/retry-incomplete -H 'X-Owner-Id: team-a'
+curl -s localhost:8080/api/releases/rel-2026-10-08 -H 'X-Owner-Id: team-a'
+```
+
 ---
 
 ## 6. 代码结构
 
 ```
-model/           设备、上报结论、期望状态/版本阶段、下发结论与请求
+model/           设备、上报结论、期望状态/版本阶段、下发结论与请求、批量发布请求/结果/汇总
 registry/        设备注册表（内存、重复注册拒绝）
 session/         GatewaySimulator：本地会话+上报通道模拟（可达性/行为/apply 幂等）
 report/          ReportIngestService（时间戳判定）、LivenessService（TTL 存活）
 compat/          CompatibilityPolicy（能力与固件版本区间）
-orchestration/   OrchestrationService + DeviceStateLedger（版本账本与每设备锁）
+orchestration/   OrchestrationService + DeviceStateLedger（版本账本与每设备锁、按 revision 补投）
+release/         ReleaseService + DeviceRelease（批量发布：幂等键、逐台成员、只补投）
 api/             REST 控制器与全局异常映射（404/403/409/400）
 config/          Clock Bean（测试中替换为 MutableClock）
 ```

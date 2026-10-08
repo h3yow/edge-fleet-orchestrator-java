@@ -52,6 +52,11 @@ public class GatewaySimulator {
         });
     }
 
+    /** 测试辅助：只读查看设备已应用的 revision 集合（验证"同版本只生效一次"）。 */
+    public Set<Long> appliedRevisionsOf(String deviceId) {
+        return Set.copyOf(appliedOf(deviceId));
+    }
+
     public DeviceSession sessionFor(String deviceId) {
         return new SimDeviceSession(deviceId, this);
     }

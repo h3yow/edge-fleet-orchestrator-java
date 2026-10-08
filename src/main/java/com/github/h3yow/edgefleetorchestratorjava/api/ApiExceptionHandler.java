@@ -28,6 +28,12 @@ public class ApiExceptionHandler {
         return build(HttpStatus.CONFLICT, "DEVICE_ALREADY_REGISTERED", ex.getMessage());
     }
 
+    @ExceptionHandler(com.github.h3yow.edgefleetorchestratorjava.release.ReleaseConflictException.class)
+    public ResponseEntity<Map<String, Object>> releaseConflict(
+            com.github.h3yow.edgefleetorchestratorjava.release.ReleaseConflictException ex) {
+        return build(HttpStatus.CONFLICT, "RELEASE_CONFLICT", ex.getMessage());
+    }
+
     @ExceptionHandler(IllegalArgumentException.class)
     public ResponseEntity<Map<String, Object>> badRequest(IllegalArgumentException ex) {
         return build(HttpStatus.BAD_REQUEST, "BAD_REQUEST", ex.getMessage());

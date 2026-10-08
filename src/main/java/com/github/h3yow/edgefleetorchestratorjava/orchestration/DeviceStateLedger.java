@@ -44,6 +44,16 @@ final class DeviceStateLedger {
         return null;
     }
 
+    /** 按 revision 精确查找历史版本；不存在返回 null。 */
+    DesiredState find(long revision) {
+        for (DesiredState s : revisions) {
+            if (s.getRevision() == revision) {
+                return s;
+            }
+        }
+        return null;
+    }
+
     int revisionCount() {
         return revisions.size();
     }

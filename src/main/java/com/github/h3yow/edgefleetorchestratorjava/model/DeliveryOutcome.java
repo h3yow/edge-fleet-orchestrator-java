@@ -13,5 +13,9 @@ public enum DeliveryOutcome {
     REJECTED_INCOMPATIBLE,
     REJECTED_BY_DEVICE,
     EXECUTION_FAILED,
-    NOT_REVOKABLE
+    NOT_REVOKABLE,
+    /** 批量发布成员：设备归属方与发布方不一致（越权，不放行）。 */
+    OWNER_MISMATCH,
+    /** 批量发布成员：设备不存在（与越权明确区分）。 */
+    DEVICE_NOT_FOUND
 }
