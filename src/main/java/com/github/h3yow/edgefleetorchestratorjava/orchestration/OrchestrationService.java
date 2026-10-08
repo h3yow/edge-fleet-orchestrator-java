@@ -17,6 +17,7 @@ import com.github.h3yow.edgefleetorchestratorjava.session.SessionResponse;
 import java.time.Clock;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -146,6 +147,111 @@ public class OrchestrationService {
             log.info("revoke accepted: deviceId={} revision={}", deviceId, pending.getRevision());
             return new DispatchResult(DeliveryOutcome.REVOKED, pending.getRevision(),
                     pending.getRevision(), pending.getLastDetail());
+        } finally {
+            ledger.lock().unlock();
+        }
+    }
+
+    // ---- batch hooks（包内可见，供 BatchPublishService 在每设备锁内原子判定/补投） ----
+
+    /** 批量层单台尝试的确定结论。 */
+    record BatchAttempt(DeliveryOutcome outcome, long revision, String detail) {
+    }
+
+    /**
+     * 批量首投某台设备（在该设备账本锁内完成全部判定，保证并发唯一）：
+     * <ol>
+     *   <li>归属/存在性先由批量层解析，本方法只处理兼容与版本；</li>
+     *   <li>若设备最新版本已 APPLIED 且 payload+requirements 与本次一致 ->
+     *       判定本来就是最新（{@code upToDate=true}），<b>不创建新版本、不重发</b>；</li>
+     *   <li>否则创建单调新版本（旧 PENDING 立即 SUPERSEDED），兼容不满足登记为
+     *       REJECTED_INCOMPATIBLE（停留 PENDING，带违规原因），满足则实际送达。</li>
+     * </ol>
+     */
+    BatchAttempt attemptForBatch(Device device, Map<String, Object> payload,
+                                 StateRequirements requirements) {
+        StateRequirements reqs = requirements == null ? StateRequirements.none() : requirements;
+        String deviceId = device.getDeviceId();
+        DeviceStateLedger ledger = ledgerFor(deviceId);
+        ledger.lock().lock();
+        try {
+            DesiredState latest = ledger.latest();
+            if (latest != null && latest.getPhase() == StatePhase.APPLIED
+                    && Objects.equals(latest.getPayload(), payload)
+                    && Objects.equals(latest.getRequirements(), reqs)) {
+                log.info("batch attempt up-to-date: deviceId={} revision={} (no new revision, no resend)",
+                        deviceId, latest.getRevision());
+                return new BatchAttempt(DeliveryOutcome.ALREADY_APPLIED,
+                        latest.getRevision(),
+                        "device already at the desired configuration at revision "
+                                + latest.getRevision() + ", nothing to resend");
+            }
+
+            long revision = ledger.nextRevision();
+            DesiredState state = new DesiredState(revision, payload, reqs, clock.instant());
+            supersedePreviousPending(ledger, revision);
+            ledger.append(state);
+
+            List<String> violations = compatibilityPolicy.violations(device, reqs);
+            if (!violations.isEmpty()) {
+                state.setLastOutcome(DeliveryOutcome.REJECTED_INCOMPATIBLE);
+                state.setLastDetail(String.join("; ", violations));
+                log.warn("batch attempt REJECTED_INCOMPATIBLE: deviceId={} revision={} violations={}",
+                        deviceId, revision, violations);
+                return new BatchAttempt(DeliveryOutcome.REJECTED_INCOMPATIBLE, revision,
+                        state.getLastDetail());
+            }
+
+            DispatchResult result = deliver(device, state);
+            log.info("batch attempt settled: deviceId={} revision={} outcome={}",
+                    deviceId, revision, result.outcome());
+            return new BatchAttempt(result.outcome(), revision, result.detail());
+        } finally {
+            ledger.lock().unlock();
+        }
+    }
+
+    /**
+     * 批量补投某台设备先前分配的 revision：
+     * <ul>
+     *   <li>该 revision 已 APPLIED -> 不重发，返回 ALREADY_APPLIED；</li>
+     *   <li>该 revision 已 REVOKED / SUPERSEDED -> 返回对应终态结论，<b>不会被拉回生效</b>；</li>
+     *   <li>仍 PENDING -> 重新送达（兼容判定沿用版本登记时的要求，不因设备固件/能力变化而放行
+     *       曾被不兼容挡下的成员；设备重新上线只影响可达性）。</li>
+     * </ul>
+     */
+    BatchAttempt retryForBatch(Device device, long revision) {
+        String deviceId = device.getDeviceId();
+        DeviceStateLedger ledger = ledgerFor(deviceId);
+        ledger.lock().lock();
+        try {
+            DesiredState state = ledger.byRevision(revision);
+            if (state == null) {
+                log.warn("batch retry missing revision: deviceId={} revision={}", deviceId, revision);
+                return new BatchAttempt(DeliveryOutcome.NOT_DELIVERED, revision,
+                        "assigned revision " + revision + " not found in device ledger");
+            }
+            switch (state.getPhase()) {
+                case APPLIED -> {
+                    log.info("batch retry skip applied: deviceId={} revision={}", deviceId, revision);
+                    return new BatchAttempt(DeliveryOutcome.ALREADY_APPLIED, revision,
+                            "revision " + revision + " already applied, not re-sent");
+                }
+                case REVOKED -> {
+                    return new BatchAttempt(DeliveryOutcome.REVOKED, revision,
+                            "revision " + revision + " was revoked and is not brought back");
+                }
+                case SUPERSEDED -> {
+                    return new BatchAttempt(DeliveryOutcome.SUPERSEDED, revision,
+                            "revision " + revision + " was superseded and is not brought back");
+                }
+                default -> {
+                    DispatchResult result = deliver(device, state);
+                    log.info("batch retry settled: deviceId={} revision={} outcome={}",
+                            deviceId, revision, result.outcome());
+                    return new BatchAttempt(result.outcome(), revision, result.detail());
+                }
+            }
         } finally {
             ledger.lock().unlock();
         }

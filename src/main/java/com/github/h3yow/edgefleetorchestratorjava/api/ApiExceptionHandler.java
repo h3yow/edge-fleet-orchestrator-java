@@ -1,5 +1,7 @@
 package com.github.h3yow.edgefleetorchestratorjava.api;
 
+import com.github.h3yow.edgefleetorchestratorjava.BatchAlreadyExistsException;
+import com.github.h3yow.edgefleetorchestratorjava.BatchNotFoundException;
 import com.github.h3yow.edgefleetorchestratorjava.DeviceNotFoundException;
 import com.github.h3yow.edgefleetorchestratorjava.OwnerMismatchException;
 import java.time.Instant;
@@ -18,9 +20,19 @@ public class ApiExceptionHandler {
         return build(HttpStatus.NOT_FOUND, "DEVICE_NOT_FOUND", ex.getMessage());
     }
 
+    @ExceptionHandler(BatchNotFoundException.class)
+    public ResponseEntity<Map<String, Object>> batchNotFound(BatchNotFoundException ex) {
+        return build(HttpStatus.NOT_FOUND, "BATCH_NOT_FOUND", ex.getMessage());
+    }
+
     @ExceptionHandler(OwnerMismatchException.class)
     public ResponseEntity<Map<String, Object>> ownerMismatch(OwnerMismatchException ex) {
         return build(HttpStatus.FORBIDDEN, "OWNER_MISMATCH", ex.getMessage());
+    }
+
+    @ExceptionHandler(BatchAlreadyExistsException.class)
+    public ResponseEntity<Map<String, Object>> batchExists(BatchAlreadyExistsException ex) {
+        return build(HttpStatus.CONFLICT, "BATCH_ALREADY_EXISTS", ex.getMessage());
     }
 
     @ExceptionHandler(IllegalStateException.class)

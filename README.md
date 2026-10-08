@@ -4,7 +4,8 @@
 
 1. 设备注册与存活状态维护（周期上报证明存活，乱序/过期/回退时间戳可区分地拒绝或忽略）；
 2. 期望状态下发与收敛（版本单调、并发唯一、同版本不重复应用、已撤销变更不复活，失败三分类）；
-3. 能力/固件版本兼容判定与归属方（owner）隔离（不兼容明确拒绝，越权与目标不存在可区分）。
+3. **面向一批设备的发布**（同一份配置+兼容要求一次发给一组设备，逐台结论+整批汇总，只补未完成、重复触发幂等）；
+4. 能力/固件版本兼容判定与归属方（owner）隔离（不兼容明确拒绝，越权与目标不存在可区分）。
 
 全部能力为内存实现 + 可控时钟，**不依赖任何外部服务、真实凭据或不可访问资源**。
 
@@ -62,6 +63,35 @@ PENDING ──未送达/被拒绝/失败──▶ 仍为 PENDING（只能用 ret
 `NOT_DELIVERED / REJECTED_* / EXECUTION_FAILED` 三类失败彼此可区分，且与 HTTP 层
 404（目标不存在）、403（越权）、409（重复注册）不混淆。
 
+### 1.5 批量发布模型 `BatchPublish*`（一批发布 ↔ 每设备一个版本）
+
+一次批量发布（batch）把**同一份期望载荷 + 同一套兼容要求**发给一组设备。创建批次时
+**冻结成员名单**（显式 `deviceIds` 列表，去重保序；列表为空则按 `ownerId` 圈定其名下全部设备）。
+
+- 批次与设备版本的关系：批次只负责“把同一配置送到一组设备、跟踪每台的结论”；
+  **版本仍由每台设备自己的账本单调分配**（每设备 revision 1,2,3…）。不同设备之间内部并行处理、
+  互不阻塞；同一设备的判定/送达仍在其设备锁内串行，因此每台设备版本单调、同一版本设备侧只生效一次。
+- 逐台结论 `BatchMemberOutcome`：
+
+| 结论 | 含义 |
+| --- | --- |
+| `APPLIED` | 本批次送达并在设备侧成功应用 |
+| `UP_TO_DATE` | 本来就是最新，无需重发（首投时发现最新已应用版本与本配置一致；或补投轮次中此前已成功、本轮不再触碰） |
+| `NOT_DELIVERED` | 设备会话不可达，未送达（可补投） |
+| `REJECTED_INCOMPATIBLE` | 首次判定时不满足兼容要求（detail 列明全部违规项），并被**永久挡下** |
+| `REJECTED_BY_DEVICE` | 设备侧业务拒绝（可补投） |
+| `EXECUTION_FAILED` | 送达后设备执行出错（可补投） |
+| `DEVICE_NOT_FOUND` | 名单里的设备根本不存在（404 语义，逐台记录，不影响其它设备） |
+| `OWNER_MISMATCH` | 名单混入别的归属方设备，按越权处理（403 语义，与“不存在”严格区分） |
+| `SKIPPED_SETTLED` | 该成员版本已被**撤销**或被**更新版本取代**，补投不会把它拉回生效 |
+| `SKIPPED_BLOCKED` | 曾因不兼容被挡下的成员，后续补投一律跳过（见 2.7） |
+| `NOT_ATTEMPTED` | 成员尚未参与过任何一次实际发布动作 |
+
+- 整批汇总 `BatchSummary`：`total / applied / alreadyApplied / upToDate / notDelivered /
+  rejectedIncompatible / rejectedByDevice / executionFailed / deviceNotFound / ownerMismatch /
+  skippedSettled / skippedBlocked`，一眼看出整批进度。个别设备连不上/失败/越权/不存在
+  **都不会把整批判为失败**，其余成员照常得到各自结论。
+
 ---
 
 ## 2. 收敛规则
@@ -77,6 +107,30 @@ PENDING ──未送达/被拒绝/失败──▶ 仍为 PENDING（只能用 ret
    `retry` 或重新 `dispatch`（新版本）推进。
 6. **归属隔离**：所有操作先查存在性（不存在 → 404），再校验 `X-Owner-Id` 与设备 owner
    （不匹配 → 403），判定顺序固定，结论稳定可区分。
+
+### 2.1 批量发布的补投与幂等
+
+7. **只补未完成**：对同一批次的再次触发（重复 `POST /api/batch-publishes`、显式
+   `POST /api/batch-publishes/{batchId}/resume`、调用方网络重发、用户连点）只处理尚未做成的成员：
+   - 已成功（`APPLIED`）的成员**不再触碰、更不会再应用一次**，在后续轮次呈现为 `UP_TO_DATE`；
+   - 未送达 / 设备拒绝 / 执行失败的成员，补投只重送**该成员先前分配的同一 revision**，不产生新版本；
+   - 已被**撤销**或已被**更新版本取代**的成员落为 `SKIPPED_SETTLED`，不会被补投拉回；
+   - 设备重新上线**只刷新可达性/存活判断**，不会顺带把已经落定的版本再放一遍。
+8. **补投动作本身幂等**：每批次一把锁，任何触发在该锁内串行；成员结论被持久记住。
+   用户手抖多次点击或网络重发导致同一批次被重复触发时，最终结果唯一确定——
+   **不会凭空产生新 revision，也不会让同一版本在设备侧生效第二次**（设备会话层另有已应用集合兜底）。
+   并发重复触发同样收敛到同一份结果（见 `BatchPublishTest` 的 12 线程并发用例）。
+9. **幂等键冲突可辨**：`batchId` 即幂等键（可调用方提供，为空则服务端生成）。
+   同一 `batchId` 被用于不同 payload/兼容要求/成员名单时返回 **409 BATCH_ALREADY_EXISTS**，
+   不会静默套用旧批次；归属方不符返回 403；批次不存在返回 404。
+10. **不兼容在批量场景永久挡下**：成员在首次兼容判定时不满足要求，会得到
+    `REJECTED_INCOMPATIBLE`（逐台列明缺失能力/固件越界原因）并被标记 `incompatibleBlocked`。
+    此后即使该设备**重新上线、或固件/能力信息发生变化**，任何补投都只会得到 `SKIPPED_BLOCKED`，
+    绝不会自动生效；**要改变它的期望状态，只能由归属方重新发起一次新的批量发布**
+    （新批次会按当时的固件/能力重新判定）。
+11. **批量归属与存在性逐台隔离**：每台成员在实际处理前都独立做“存在性 + 归属方 + 兼容范围”判定：
+    设备不存在逐台记 `DEVICE_NOT_FOUND`，属于别的 owner 逐台记 `OWNER_MISMATCH`，二者不混淆、
+    不影响同批其它设备；按 owner 圈定时只包含该归属方名下设备。
 
 ---
 
@@ -103,6 +157,9 @@ PENDING ──未送达/被拒绝/失败──▶ 仍为 PENDING（只能用 ret
 | `POST /api/devices/{id}/desired-state/dispatch` | 下发新版本 | header `X-Owner-Id` |
 | `POST /api/devices/{id}/desired-state/retry` | 重试最新 PENDING | header `X-Owner-Id` |
 | `POST /api/devices/{id}/desired-state/revoke` | 撤销最新 PENDING | header `X-Owner-Id` |
+| `POST /api/batch-publishes` | 发起一批发布（body：`batchId?/payload/requirements/deviceIds?`；`deviceIds` 为空则按 owner 圈定）；同 `batchId` 重复触发即幂等补投 | header `X-Owner-Id` |
+| `POST /api/batch-publishes/{batchId}/resume` | 只补投该批未完成成员 | header `X-Owner-Id` |
+| `GET /api/batch-publishes/{batchId}` | 查询逐台结论与整批汇总 | header `X-Owner-Id` |
 | `POST /api/ops/liveness/sweep` | 触发一次全量 TTL 扫描 | 无（本地运维） |
 
 ---
@@ -123,6 +180,13 @@ scripts/local-verify.sh
   （`IGNORED_STALE_TIMESTAMP` 且不覆盖状态）、缺失/未来时间戳拒绝、TTL 过期转 OFFLINE 与恢复；
 - `OrchestrationTest`：重复下发版本单调且不重复应用、**16 线程并发下发唯一收敛**、
   未送达/设备拒绝/执行失败三分类、失败后 retry 恢复、撤销后不复活、不兼容拒绝带原因；
+- `BatchPublishTest`（12 例）：混合结论逐台+汇总、**只补未完成**（已成功的呈现 UP_TO_DATE
+  且版本不变）、**重复触发/并发重复触发幂等**（12 线程并发同一批次，每设备版本恒为 1、不重复应用）、
+  不兼容成员重新上线后仍永久挡下（只能新批次重判）、按 owner 圈定、逐台 403/404 区分、
+  撤销/取代后补投不复活（SKIPPED_SETTLED）、乱序分批恢复、首投即“本来最新”识别、名单去重、
+  空目标集 400、同 batchId 换内容 409；
+- `BatchPublishIntegrationTest`：经 MockMvc 验证批量发布三个 HTTP 入口及
+  409/403/404/400 错误码与逐台结论、汇总字段一致；
 - `CompatibilityPolicyTest`：固件闭区间边界、能力缺失逐条列出；
 - `AccessControlTest`：跨 owner 越权（403 语义）与目标不存在（404 语义）可区分；
 - `WebApiIntegrationTest`：经 MockMvc 验证全部 HTTP 入口结论与错误码一致。
@@ -160,6 +224,31 @@ curl -i localhost:8080/api/devices/edge-1/desired-state/retry -X POST -H 'X-Owne
 curl -i localhost:8080/api/devices/ghost
 ```
 
+批量发布（同一配置发给一组设备；逐台结论 + 汇总）：
+
+```bash
+# 注册两台 team-a 设备
+for d in edge-a edge-b; do
+  curl -s localhost:8080/api/devices -H 'Content-Type: application/json' -d "{
+    \"deviceId\":\"$d\",\"ownerId\":\"team-a\",\"firmwareVersion\":\"1.4.0\",
+    \"capabilities\":[\"gps\",\"ble\"]}"
+done
+
+# 发起一批（显式名单；deviceIds 留空 [] 则按 X-Owner-Id 圈定名下全部设备）
+curl -s localhost:8080/api/batch-publishes \
+  -H 'Content-Type: application/json' -H 'X-Owner-Id: team-a' -d '{
+    "batchId":"batch-demo-1",
+    "payload":{"mode":"eco"},
+    "requirements":{"requiredCapabilities":["gps"],"minFirmware":"1.0.0"},
+    "deviceIds":["edge-a","edge-b"]}'
+
+# 只补没做成的成员（重复触发同一 batchId 等价；均幂等）
+curl -s -X POST localhost:8080/api/batch-publishes/batch-demo-1/resume -H 'X-Owner-Id: team-a'
+
+# 查询整批进度
+curl -s localhost:8080/api/batch-publishes/batch-demo-1 -H 'X-Owner-Id: team-a'
+```
+
 ---
 
 ## 6. 代码结构
@@ -171,6 +260,7 @@ session/         GatewaySimulator：本地会话+上报通道模拟（可达性/
 report/          ReportIngestService（时间戳判定）、LivenessService（TTL 存活）
 compat/          CompatibilityPolicy（能力与固件版本区间）
 orchestration/   OrchestrationService + DeviceStateLedger（版本账本与每设备锁）
+                 BatchPublishService（批量发布：冻结名单、并行逐台处理、补投/幂等、永久挡下）
 api/             REST 控制器与全局异常映射（404/403/409/400）
 config/          Clock Bean（测试中替换为 MutableClock）
 ```
